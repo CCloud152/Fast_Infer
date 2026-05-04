@@ -12,7 +12,7 @@ from fast_infer.kv_cache import KVCache
 
 class LlamaForCausalLM:
     def __init__(self, config: LlamaConfig, weights: dict, device: torch.device = None,
-                 memory_efficient: bool = False):
+                 memory_efficient: bool = True):
         self.config = config
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.memory_efficient = memory_efficient
