@@ -132,14 +132,84 @@ def _fused_int4_matmul(x: torch.Tensor, packed: torch.Tensor,
     return c.reshape(*orig_shape[:-1], N)
 
 
-# ---- FP16 path (for pre-dequantized weights) ----
+# ---- FP16 Triton matmul (faster than torch.matmul for small M) ----
+
+@triton.jit
+def _fp16_matmul_kernel(
+    a_ptr, w_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """Standard tiled FP16 matmul C = A @ W.T with FP32 accumulation."""
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_offs = k_start + offs_k
+        m_mask = offs_m < M
+        n_mask = offs_n < N
+        k_mask = k_offs < K
+
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + k_offs[None, :] * stride_ak,
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0
+        )  # [BLOCK_M, BLOCK_K]
+
+        w = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + k_offs[None, :] * stride_wk,
+            mask=n_mask[:, None] & k_mask[None, :], other=0.0
+        )  # [BLOCK_N, BLOCK_K]
+
+        acc += tl.dot(a.to(tl.float16), tl.trans(w.to(tl.float16)))
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc.to(tl.float16),
+             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
 
 def _fp16_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Plain FP16 matmul for dequantized weights."""
+    """Triton FP16 matmul — faster than torch.matmul for decode (M=1)."""
     orig_shape = x.shape
     x = x.reshape(-1, x.shape[-1])
-    out = torch.matmul(x.to(w.dtype), w.T)
-    return out.reshape(*orig_shape[:-1], w.shape[0])
+    if x.dtype != w.dtype:
+        x = x.to(w.dtype)
+    M, K = x.shape
+    N = w.shape[0]
+    c = torch.empty(M, N, dtype=torch.float16, device=x.device)
+
+    BLOCK_M = 16
+    BLOCK_N = 64
+    BLOCK_K = 128
+    GROUP_M = 8
+
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _fp16_matmul_kernel[grid](
+        x, w, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        w.stride(0), w.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+    )
+    return c.reshape(*orig_shape[:-1], N)
 
 
 # ---- Public API ----
@@ -164,7 +234,10 @@ def int4_matmul(x: torch.Tensor, w, scales=None, groupsize: int = 128) -> torch.
 # ---- Weight preparation ----
 
 def dequantize_all(weights: dict) -> dict:
-    """Dequantize all INT4 linear weights to FP16 in-place. Frees INT4 memory."""
+    """Dequantize all INT4 linear weights to FP16 in-place. Frees INT4 memory.
+
+    Also concatenates Q, K, V weights into a single qkv_proj tensor for fused matmul.
+    """
     for layer in weights["layers"]:
         for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             w = layer["self_attn"][proj_name]
@@ -174,6 +247,16 @@ def dequantize_all(weights: dict) -> dict:
             w = layer["mlp"][proj_name]
             if isinstance(w, tuple):
                 layer["mlp"][proj_name] = _dequant_storage(*w)
+
+        # Concatenate Q, K, V for fused matmul (one kernel launch instead of three)
+        q, k, v = (layer["self_attn"]["q_proj"],
+                   layer["self_attn"]["k_proj"],
+                   layer["self_attn"]["v_proj"])
+        layer["self_attn"]["qkv_proj"] = torch.cat([q, k, v], dim=0)
+        del layer["self_attn"]["q_proj"]
+        del layer["self_attn"]["k_proj"]
+        del layer["self_attn"]["v_proj"]
+
     torch.cuda.empty_cache()
     return weights
 

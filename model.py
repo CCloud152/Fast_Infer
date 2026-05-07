@@ -45,16 +45,17 @@ class LlamaForCausalLM:
             self._token_count = 0
             self._allocated_blocks = 0
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, return_hidden_states: bool = False):
         """
         Single forward pass handling both prefill and decode.
         input_ids: [batch, seq_len] (prefill) or [batch, 1] (decode)
-        Returns logits: [batch, seq_len, vocab_size]
+        Returns logits: [batch, seq_len, vocab_size], and optionally hidden_states list.
         """
         batch_size, seq_len = input_ids.shape
         self._ensure_kv_cache(batch_size)
 
         is_prefill = seq_len > 1 or self._token_count == 0
+        hidden_states = [] if return_hidden_states else None
 
         # Embedding
         h = self.weights["embed_tokens"][input_ids]  # [batch, seq_len, hidden_size]
@@ -68,8 +69,8 @@ class LlamaForCausalLM:
             positions = torch.tensor([self._token_count], device=self.device)
             self._token_count += 1
 
-        cos_pos = self.cos[positions]  # [seq_len, head_dim]
-        sin_pos = self.sin[positions]
+        cos_pos = self.cos[positions].to(torch.float16)  # [seq_len, head_dim]
+        sin_pos = self.sin[positions].to(torch.float16)
 
         for layer_idx in range(self.num_layers):
             layer_w = self.weights["layers"][layer_idx]
@@ -77,11 +78,17 @@ class LlamaForCausalLM:
             # --- Attention block ---
             residual = h
             h_normed = rms_norm(h, layer_w["input_layernorm"], self.config.rms_norm_eps)
+            kv_size = self.num_kv_heads * self.head_dim
 
-            # Q, K, V projections (INT4)
-            q = int4_matmul(h_normed, layer_w["self_attn"]["q_proj"])
-            k = int4_matmul(h_normed, layer_w["self_attn"]["k_proj"])
-            v = int4_matmul(h_normed, layer_w["self_attn"]["v_proj"])
+            if "qkv_proj" in layer_w["self_attn"]:
+                # Speed mode: single fused matmul on concatenated weights
+                qkv = int4_matmul(h_normed, layer_w["self_attn"]["qkv_proj"])
+                q, k, v = qkv.split([self.hidden_size, kv_size, kv_size], dim=-1)
+            else:
+                # Memory mode: three separate INT4 matmuls
+                q = int4_matmul(h_normed, layer_w["self_attn"]["q_proj"])
+                k = int4_matmul(h_normed, layer_w["self_attn"]["k_proj"])
+                v = int4_matmul(h_normed, layer_w["self_attn"]["v_proj"])
 
             # Reshape to multi-head
             q = q.view(batch_size, seq_len, self.num_q_heads, self.head_dim)
@@ -124,6 +131,8 @@ class LlamaForCausalLM:
             # O projection
             h_out = int4_matmul(attn_out, layer_w["self_attn"]["o_proj"])
             h = residual + h_out
+            if return_hidden_states:
+                hidden_states.append(h.detach())
 
             # --- MLP block ---
             residual = h
@@ -135,13 +144,18 @@ class LlamaForCausalLM:
                 layer_w["mlp"]["down_proj"],
             )
             h = residual + h_out
+            if return_hidden_states:
+                hidden_states.append(h.detach())
 
         # Final RMSNorm
         h_normed = rms_norm(h, self.weights["norm"], self.config.rms_norm_eps)
 
         # LM head (stay in FP16 — the vocab matmul is expensive enough without FP32 upcast)
         logits = torch.matmul(h_normed, self.weights["lm_head"].T)
-        return logits.float()  # cast to FP32 only for the (small) output
+        logits = logits.float()  # cast to FP32 only for the (small) output
+        if return_hidden_states:
+            return logits, hidden_states
+        return logits
 
     def _store_kv_prefill(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
         """Store prefill K, V into cache. k, v: [batch, seq_len, num_kv_heads, head_dim]"""
