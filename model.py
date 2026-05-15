@@ -4,7 +4,7 @@ import torch
 from fast_infer.config import LlamaConfig
 from fast_infer.kernels.rms_norm import rms_norm
 from fast_infer.kernels.rope import precompute_freqs, apply_rope
-from fast_infer.kernels.matmul import int4_matmul, dequantize_all
+from fast_infer.kernels.matmul import int4_matmul, dequantize_all, fuse_qkv_inplace
 from fast_infer.kernels.mlp import swiglu_mlp
 from fast_infer.kernels.attention import flash_attention, paged_attention
 from fast_infer.kv_cache import KVCache
@@ -19,6 +19,8 @@ class LlamaForCausalLM:
 
         if not memory_efficient:
             weights = dequantize_all(weights)
+        else:
+            fuse_qkv_inplace(weights)
         self.weights = weights
         self.num_layers = config.num_hidden_layers
         self.hidden_size = config.hidden_size
@@ -29,7 +31,7 @@ class LlamaForCausalLM:
 
         # Precompute RoPE frequencies
         self.cos, self.sin = precompute_freqs(
-            config.head_dim, config.max_position_embeddings, config.rope_theta, self.device
+            config.head_dim, config.max_seq_len, config.rope_theta, self.device
         )
 
         # KV cache (created on first use with actual batch size)
@@ -139,9 +141,9 @@ class LlamaForCausalLM:
             h_normed = rms_norm(h, layer_w["post_attention_layernorm"], self.config.rms_norm_eps)
             h_out = swiglu_mlp(
                 h_normed,
-                layer_w["mlp"]["gate_proj"],
-                layer_w["mlp"]["up_proj"],
+                layer_w["mlp"]["gate_up_proj"],
                 layer_w["mlp"]["down_proj"],
+                self.config.intermediate_size,
             )
             h = residual + h_out
             if return_hidden_states:

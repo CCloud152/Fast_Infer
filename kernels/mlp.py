@@ -36,17 +36,18 @@ def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def swiglu_mlp(x: torch.Tensor,
-               gate_w: torch.Tensor,
-               up_w: torch.Tensor,
-               down_w: torch.Tensor) -> torch.Tensor:
+               gate_up_w,
+               down_w: torch.Tensor,
+               intermediate_size: int = 8192) -> torch.Tensor:
     """
     SwiGLU MLP forward.
     x: [batch, hidden_size] FP16
-    gate_w, up_w, down_w: [intermediate_size, hidden_size] or [hidden_size, intermediate_size] FP16
+    gate_up_w: fused [2*intermediate_size, hidden_size] (FP16 or INT4 tuple)
+    down_w: [hidden_size, intermediate_size]
     Returns: [batch, hidden_size] FP16
     """
-    gate = int4_matmul(x, gate_w)   # [batch, intermediate_size]
-    up = int4_matmul(x, up_w)        # [batch, intermediate_size]
-    act = silu_mul(gate, up)         # fused SiLU + multiply
-    out = int4_matmul(act, down_w)   # [batch, hidden_size]
+    gate_up = int4_matmul(x, gate_up_w)              # [batch, 2*intermediate_size]
+    gate, up = gate_up.split(intermediate_size, dim=-1)
+    act = silu_mul(gate, up)                         # fused SiLU + multiply
+    out = int4_matmul(act, down_w)                   # [batch, hidden_size]
     return out

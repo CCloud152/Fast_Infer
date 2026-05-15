@@ -248,7 +248,7 @@ def dequantize_all(weights: dict) -> dict:
             if isinstance(w, tuple):
                 layer["mlp"][proj_name] = _dequant_storage(*w)
 
-        # Concatenate Q, K, V for fused matmul (one kernel launch instead of three)
+        # Concatenate Q, K, V for fused matmul
         q, k, v = (layer["self_attn"]["q_proj"],
                    layer["self_attn"]["k_proj"],
                    layer["self_attn"]["v_proj"])
@@ -257,8 +257,53 @@ def dequantize_all(weights: dict) -> dict:
         del layer["self_attn"]["k_proj"]
         del layer["self_attn"]["v_proj"]
 
+        # Concatenate gate, up for fused MLP matmul
+        g, u = layer["mlp"]["gate_proj"], layer["mlp"]["up_proj"]
+        layer["mlp"]["gate_up_proj"] = torch.cat([g, u], dim=0)
+        del layer["mlp"]["gate_proj"], layer["mlp"]["up_proj"]
+
     torch.cuda.empty_cache()
     return weights
+
+
+def fuse_qkv_inplace(weights: dict):
+    """Fuse Q/K/V and gate/up projection weights to reduce kernel launches.
+
+    Attention: Q, K, V → single qkv_proj (3 matmuls → 1 per layer)
+    MLP: gate, up → single gate_up_proj (2 matmuls → 1 per layer)
+    Total: 5 matmul kernel launches saved per layer (28 × 5 = 140 fewer launches total).
+    """
+    for layer in weights["layers"]:
+        # Fuse attention Q/K/V
+        sa = layer["self_attn"]
+        if "qkv_proj" not in sa:
+            q, k, v = sa["q_proj"], sa["k_proj"], sa["v_proj"]
+            if isinstance(q, tuple):
+                qp, qs = q
+                kp, ks = k
+                vp, vs = v
+                sa["qkv_proj"] = (
+                    torch.cat([qp, kp, vp], dim=0),
+                    torch.cat([qs, ks, vs], dim=0),
+                )
+            else:
+                sa["qkv_proj"] = torch.cat([q, k, v], dim=0)
+            del sa["q_proj"], sa["k_proj"], sa["v_proj"]
+
+        # Fuse MLP gate/up
+        mlp = layer["mlp"]
+        if "gate_up_proj" not in mlp:
+            g, u = mlp["gate_proj"], mlp["up_proj"]
+            if isinstance(g, tuple):
+                gp, gs = g
+                up, us = u
+                mlp["gate_up_proj"] = (
+                    torch.cat([gp, up], dim=0),
+                    torch.cat([gs, us], dim=0),
+                )
+            else:
+                mlp["gate_up_proj"] = torch.cat([g, u], dim=0)
+            del mlp["gate_proj"], mlp["up_proj"]
 
 
 def _dequant_storage(packed: torch.Tensor, scales: torch.Tensor,
